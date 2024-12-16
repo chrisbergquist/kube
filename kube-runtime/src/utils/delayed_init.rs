@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Mutex, task::Poll};
+use std::{fmt::Debug, sync::Mutex, task::{Poll, Waker}};
 
 use futures::{channel, Future, FutureExt};
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub struct DelayedInit<T> {
 }
 #[derive(Debug)]
 enum ReceiverState<T> {
-    Waiting(channel::oneshot::Receiver<T>),
+    Waiting(channel::oneshot::Receiver<T>, Vec<Waker>),
     Ready(Result<T, InitDropped>),
 }
 impl<T> DelayedInit<T> {
@@ -40,7 +40,7 @@ impl<T> DelayedInit<T> {
     pub fn new() -> (Initializer<T>, Self) {
         let (tx, rx) = channel::oneshot::channel();
         (Initializer(tx), DelayedInit {
-            state: Mutex::new(ReceiverState::Waiting(rx)),
+            state: Mutex::new(ReceiverState::Waiting(rx, Vec::new())),
         })
     }
 }
@@ -75,14 +75,21 @@ where
         let mut state = self.0.state.lock().unwrap();
         trace!("got lock lock");
         match &mut *state {
-            ReceiverState::Waiting(rx) => {
+            ReceiverState::Waiting(rx, wakers) => {
                 trace!("channel still active, polling");
                 if let Poll::Ready(value) = rx.poll_unpin(cx).map_err(|_| InitDropped) {
                     trace!("got value on slow path, memoizing");
+                    let mut to_wake = Vec::new();
+                    std::mem::swap(wakers, &mut to_wake);
                     *state = ReceiverState::Ready(value.clone());
+                    trace!("waking up {} wakers", to_wake.len());
+                    for waker in to_wake {
+                        waker.wake();
+                    }
                     Poll::Ready(value)
                 } else {
-                    trace!("channel is still pending");
+                    trace!("channel is still pending, adding waker to state");
+                    wakers.push(cx.waker().clone());
                     Poll::Pending
                 }
             }
